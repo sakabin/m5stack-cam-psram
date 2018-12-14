@@ -4,20 +4,21 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#include "driver/gpio.h"
-#include "sdkconfig.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "soc/uart_struct.h"
 
+#include "string.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
-#include "esp_event_loop.h"
-#include "esp_http_server.h"
 
-static const char* TAG = "camera";
-
+/* Define ------------------------------------------------------------------- */
 //M5STACK_CAM PIN Map
+#define CAM_PIN_PWDN    -1 //power down is not used
 #define CAM_PIN_RESET   15 //software reset will be performed
 #define CAM_PIN_XCLK    27
 #define CAM_PIN_SIOD    25
@@ -38,20 +39,13 @@ static const char* TAG = "camera";
 
 #define CAM_XCLK_FREQ   20000000
 
-#define CAM_USE_WIFI
+/* Static var --------------------------------------------------------------- */
+static const char* TAG = "camera";
+static const int RX_BUF_SIZE = 1024;
 
-#define ESP_WIFI_SSID "m5stack-cam"
-#define ESP_WIFI_PASS ""
-#define MAX_STA_CONN  1
+/* Static fun --------------------------------------------------------------- */
+static void uart_init();
 
-#define PART_BOUNDARY "123456789000000000000987654321"
-static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-
-static EventGroupHandle_t s_wifi_event_group;
-static ip4_addr_t s_ip_addr;
-const int CONNECTED_BIT = BIT0;
 
 static camera_config_t camera_config = {
     .pin_reset = CAM_PIN_RESET,
@@ -77,14 +71,11 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,//YUV422,GRAYSCALE,RGB565,JPEG
-    .frame_size = FRAMESIZE_QVGA,//QQVGA-UXGA Do not use sizes above QVGA when not JPEG
+    .frame_size = FRAMESIZE_HQVGA,//QQVGA-UXGA Do not use sizes above QVGA when not JPEG
 
-    .jpeg_quality = 2, //0-63 lower number means higher quality
+    .jpeg_quality = 3, //0-63 lower number means higher quality
     .fb_count = 3 //if more than one, i2s runs in continuous mode. Use only with JPEG
 };
-
-static void wifi_init_softap();
-static esp_err_t http_server_init();
 
 void app_main()
 {
@@ -95,197 +86,50 @@ void app_main()
         ESP_ERROR_CHECK( nvs_flash_erase() );
         ESP_ERROR_CHECK( nvs_flash_init() );
     }
+    
+    uart_init();
 
     err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera Init Failed");
-    }
     
-    wifi_init_softap();
+    }
 
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    http_server_init();
-}
-
-#ifdef CAM_USE_WIFI
-
-esp_err_t jpg_httpd_handler(httpd_req_t *req){
-    camera_fb_t * fb = NULL;
-    esp_err_t res = ESP_OK;
-    size_t fb_len = 0;
-    int64_t fr_start = esp_timer_get_time();
-
-    fb = esp_camera_fb_get();
-    if (!fb) {
-        ESP_LOGE(TAG, "Camera capture failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    res = httpd_resp_set_type(req, "image/jpeg");
-    if(res == ESP_OK){
-        res = httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-    }
-
-    if(res == ESP_OK){
-        fb_len = fb->len;
-        res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    }
-    esp_camera_fb_return(fb);
-    int64_t fr_end = esp_timer_get_time();
-    ESP_LOGI(TAG, "JPG: %uKB %ums", (uint32_t)(fb_len/1024), (uint32_t)((fr_end - fr_start)/1000));
-    return res;
-}
-
-esp_err_t jpg_stream_httpd_handler(httpd_req_t *req){
-    camera_fb_t * fb = NULL;
-    esp_err_t res = ESP_OK;
-    size_t _jpg_buf_len;
-    uint8_t * _jpg_buf;
-    char * part_buf[64];
-    static int64_t last_frame = 0;
-    if(!last_frame) {
-        last_frame = esp_timer_get_time();
-    }
-
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if(res != ESP_OK){
-        return res;
-    }
+    
+    char tx_buffer[200] = { '\0' };
+    uint32_t data_len = 0;
+    
+    tx_buffer[0] = 0xFF;
+    tx_buffer[1] = 0xD8;
+    tx_buffer[2] = 0xEA;
+    tx_buffer[3] = 0x01;
 
     while(true){
-        fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGE(TAG, "Camera capture failed");
-            res = ESP_FAIL;
-        } else {
-            if(fb->format != PIXFORMAT_JPEG){
-                bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-                if(!jpeg_converted){
-                    ESP_LOGE(TAG, "JPEG compression failed");
-                    esp_camera_fb_return(fb);
-                    res = ESP_FAIL;
-                }
-            } else {
-                _jpg_buf_len = fb->len;
-                _jpg_buf = fb->buf;
-            }
-        }
-        if(res == ESP_OK){
-            size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
-
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-        }
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-        }
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        }
-        if(fb->format != PIXFORMAT_JPEG){
-            free(_jpg_buf);
-        }
+        camera_fb_t * fb = esp_camera_fb_get();
+        tx_buffer[4] = (uint8_t)((fb->len & 0xFF0000) >> 16) ;
+        tx_buffer[5] = (uint8_t)((fb->len & 0x00FF00) >> 8 ) ;
+        tx_buffer[6] = (uint8_t)((fb->len & 0x0000FF) >> 0 );
+        
+        uart_write_bytes(UART_NUM_1, (char *)tx_buffer, 7);
+        uart_write_bytes(UART_NUM_1, (char *)fb->buf, fb->len);
+        data_len =(uint32_t)(tx_buffer[4] << 16) | (tx_buffer[5] << 8) | tx_buffer[6];
+        printf("should %d, print a image, len: %d\r\n",fb->len, data_len);
         esp_camera_fb_return(fb);
-        if(res != ESP_OK){
-            break;
-        }
-        int64_t fr_end = esp_timer_get_time();
-        int64_t frame_time = fr_end - last_frame;
-        last_frame = fr_end;
-        frame_time /= 1000;
-        ESP_LOGI(TAG, "MJPG: %uKB %ums (%.1ffps)",
-            (uint32_t)(_jpg_buf_len/1024),
-            (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time);
     }
-
-    last_frame = 0;
-    return res;
 }
 
-static esp_err_t http_server_init(){
-    httpd_handle_t server;
-    httpd_uri_t jpeg_uri = {
-        .uri = "/jpg",
-        .method = HTTP_GET,
-        .handler = jpg_httpd_handler,
-        .user_ctx = NULL
+
+static void uart_init() {
+    const uart_config_t uart_config = {
+        .baud_rate = 921600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
     };
-
-    httpd_uri_t jpeg_stream_uri = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = jpg_stream_httpd_handler,
-        .user_ctx = NULL
-    };
-
-    httpd_config_t http_options = HTTPD_DEFAULT_CONFIG();
-
-    ESP_ERROR_CHECK(httpd_start(&server, &http_options));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &jpeg_uri));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &jpeg_stream_uri));
-
-    return ESP_OK;
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, 13, 12, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // We won't use a buffer for sending data.
+    uart_driver_install(UART_NUM_1, RX_BUF_SIZE * 2, 0, 0, NULL, 0);
 }
-
-static esp_err_t event_handler(void* ctx, system_event_t* event) 
-{
-  switch (event->event_id) {
-    case SYSTEM_EVENT_STA_START:
-      esp_wifi_connect();
-      break;
-    case SYSTEM_EVENT_STA_GOT_IP:
-      ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->event_info.got_ip.ip_info.ip));
-      s_ip_addr = event->event_info.got_ip.ip_info.ip;
-      xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
-      break;
-    case SYSTEM_EVENT_AP_STACONNECTED:
-      ESP_LOGI(TAG, "station:" MACSTR " join, AID=%d", MAC2STR(event->event_info.sta_connected.mac),
-               event->event_info.sta_connected.aid);
-      xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
-      break;
-    case SYSTEM_EVENT_AP_STADISCONNECTED:
-      ESP_LOGI(TAG, "station:" MACSTR "leave, AID=%d", MAC2STR(event->event_info.sta_disconnected.mac),
-               event->event_info.sta_disconnected.aid);
-      xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
-      break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-      esp_wifi_connect();
-      xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
-      break;
-    default:
-      break;
-  }
-  return ESP_OK;
-}
-
-static void wifi_init_softap() 
-{
-  s_wifi_event_group = xEventGroupCreate();
-
-  tcpip_adapter_init();
-  ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
-
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-  wifi_config_t wifi_config = {
-      .ap = {.ssid = ESP_WIFI_SSID,
-             .ssid_len = strlen(ESP_WIFI_SSID),
-             .password = ESP_WIFI_PASS,
-             .max_connection = MAX_STA_CONN,
-             .authmode = WIFI_AUTH_WPA_WPA2_PSK},
-  };
-  if (strlen(ESP_WIFI_PASS) == 0) {
-    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-  }
-
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-  ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
-
-  uint8_t addr[4] = {192, 168, 4, 1};
-  s_ip_addr = *(ip4_addr_t*)&addr;
-
-  ESP_LOGI(TAG, "wifi_init_softap finished.SSID:%s password:%s",
-           ESP_WIFI_SSID, ESP_WIFI_PASS);
-}
-
-#endif
