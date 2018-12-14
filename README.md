@@ -1,4 +1,4 @@
-# M5Stack Camera with psram base in [espressif/esp32-camera](https://github.com/espressif/esp32-camera.git)
+# M5Stack Camera with psram base in [esp32-camera](https://github.com/espressif/esp32-camera.git)
 
 
 ## General Information
@@ -22,5 +22,5 @@ This repository hosts ESP32 compatible driver for OV2640 image sensors. Addition
 - try to copy main.c file to your new arduino project
 - make it and dowmload
 
-## line connect
+## Line connect
 ![image text](connect.jpg)
