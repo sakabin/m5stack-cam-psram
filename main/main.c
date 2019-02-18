@@ -17,8 +17,8 @@
 
 static const char* TAG = "camera";
 
-#define M5_CAM_KIND 1 // 1 --> A model, 2 --> B model
-// #define FISH_EYE_CAM  // fish eye need flip image
+#define M5_CAM_KIND 2 // 1 --> A model, 2 --> B model
+#define FISH_EYE_CAM  // fish eye need flip image
 #define CAM_USE_WIFI
 
 #if M5_CAM_KIND == 1
@@ -48,11 +48,11 @@ static const char* TAG = "camera";
 
 #define CAM_XCLK_FREQ   10000000
 
-#define ESP_WIFI_SSID "M5Psram_Cam"
+#define ESP_WIFI_SSID "M5Imu_Cam"
 #define ESP_WIFI_PASS ""
 #define MAX_STA_CONN  1
-
 #define PART_BOUNDARY "123456789000000000000987654321"
+
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
@@ -60,7 +60,12 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 static EventGroupHandle_t s_wifi_event_group;
 static ip4_addr_t s_ip_addr;
 const int CONNECTED_BIT = BIT0;
+
 extern void led_brightness(int duty);
+extern void task_initI2C(void*);
+extern void task_mpu6050(void*);
+extern volatile double ypr_data[3];
+
 static camera_config_t camera_config = {
     .pin_reset = CAM_PIN_RESET,
     .pin_xclk = CAM_PIN_XCLK,
@@ -120,6 +125,9 @@ void app_main()
     sensor_t *s = esp_camera_sensor_get();
     s->set_vflip(s, 1);
 #endif
+    xTaskCreate(&task_initI2C, "mpu_task", 2048, NULL, 5, NULL);
+    vTaskDelay(500/portTICK_PERIOD_MS);
+    xTaskCreate(&task_mpu6050, "task_mpu6050", 8192, NULL, 5, NULL);
 
 #ifdef CAM_USE_WIFI
     wifi_init_softap();
@@ -130,6 +138,14 @@ void app_main()
 }
 
 #ifdef CAM_USE_WIFI
+
+esp_err_t imu_handler(httpd_req_t *req) {
+    esp_err_t res = ESP_OK;
+    char req_str[100];
+    sprintf(req_str, "y:%3.1f r:%3.1f p:%3.1f", ypr_data[0], ypr_data[1], ypr_data[2]);
+    res = httpd_resp_send(req, req_str, strlen(req_str));
+    return res;
+}
 
 esp_err_t jpg_httpd_handler(httpd_req_t *req){
     camera_fb_t * fb = NULL;
@@ -232,6 +248,13 @@ static esp_err_t http_server_init(){
         .user_ctx = NULL
     };
 
+    httpd_uri_t imu_uri = {
+        .uri = "/imu",
+        .method = HTTP_GET,
+        .handler = imu_handler,
+        .user_ctx = NULL
+    };
+
     httpd_uri_t jpeg_stream_uri = {
         .uri = "/",
         .method = HTTP_GET,
@@ -243,6 +266,7 @@ static esp_err_t http_server_init(){
 
     ESP_ERROR_CHECK(httpd_start(&server, &http_options));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &jpeg_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &imu_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &jpeg_stream_uri));
 
     return ESP_OK;
