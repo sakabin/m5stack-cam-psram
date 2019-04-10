@@ -40,6 +40,14 @@ void task_initI2C(void *ignore) {
 	vTaskDelete(NULL);
 }
 
+static bool state = true;
+void imuTaskExit() {
+	state = false;
+	while(state == false) {
+		vTaskDelay(20/portTICK_PERIOD_MS);
+	}
+}
+
 void task_mpu6050(void*) {
 	printf("mpu6050 task begin\r\n");
 	MPU6050 mpu = MPU6050();
@@ -55,7 +63,7 @@ void task_mpu6050(void*) {
 	mpu.setDMPEnabled(true);
 
 	// MPU6050 work LED status
-	while(1){
+	while(state){
 	    mpuIntStatus = mpu.getIntStatus();
 		// get current FIFO count
 		fifoCount = mpu.getFIFOCount();
@@ -88,7 +96,7 @@ void task_mpu6050(void*) {
 	    // Now its 0x13, which means DMP is refreshed with 10Hz rate
 		vTaskDelay(100/portTICK_PERIOD_MS);
 	}
-
+	state = true;
 	vTaskDelete(NULL);
 }
 

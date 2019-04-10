@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
+#include <driver/i2c.h>
 #include "sdkconfig.h"
 #include "esp_log.h"
 
@@ -65,6 +66,7 @@ extern void led_brightness(int duty);
 extern void task_initI2C(void*);
 extern void task_mpu6050(void*);
 extern volatile double ypr_data[3];
+extern void imuTaskExit();
 
 static camera_config_t camera_config = {
     .pin_reset = CAM_PIN_RESET,
@@ -131,10 +133,14 @@ void app_main()
 
 #ifdef CAM_USE_WIFI
     wifi_init_softap();
-
     vTaskDelay(100 / portTICK_PERIOD_MS);
     http_server_init();
 #endif
+    imuTaskExit();
+    i2c_driver_delete(I2C_NUM_0);
+    gpio_reset_pin(GPIO_NUM_23);
+    gpio_reset_pin(GPIO_NUM_22);
+    esp_restart();
 }
 
 #ifdef CAM_USE_WIFI
